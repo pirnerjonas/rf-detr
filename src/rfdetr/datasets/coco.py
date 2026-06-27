@@ -17,16 +17,19 @@
 Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references/detection/coco_utils.py
 """
 
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 import torch
 import torch.utils.data
 import torchvision
 from PIL import Image
+from torch import Tensor
 from torchvision.transforms.v2 import Compose, ToDtype, ToImage
 
-from rfdetr.datasets.aug_config import AUG_CONFIG
+from rfdetr.datasets.aug_configs import AUG_CONFIG
 from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize
 from rfdetr.utilities.logger import get_logger
 
@@ -37,12 +40,82 @@ def is_valid_coco_dataset(dataset_dir: str) -> bool:
     return (Path(dataset_dir) / "train" / "_annotations.coco.json").exists()
 
 
+def _category_ids_with_keypoints(coco: Any) -> list[int]:
+    """Return sorted COCO category ids that carry keypoint metadata or annotations."""
+    category_ids = {
+        int(cat_id) for cat_id, category in coco.cats.items() if category.get("keypoints") or category.get("skeleton")
+    }
+    if category_ids:
+        return sorted(category_ids)
+
+    for annotation in coco.anns.values():
+        if annotation.get("keypoints") or int(annotation.get("num_keypoints", 0)) > 0:
+            category_ids.add(int(annotation["category_id"]))
+    return sorted(category_ids)
+
+
+def _build_keypoint_cat2label(coco: Any, num_keypoints_per_class: list[int] | None) -> dict[int, int]:
+    """Map COCO category ids onto model label slots that have keypoint capacity.
+
+    RF-DETR keypoint schemas are indexed by model label. The preview person-keypoint schema is ``[17]``: label slot
+    ``0`` owns the 17 COCO person keypoints. Legacy checkpoints may still use a background-first ``[0, 17]`` schema
+    where slot ``0`` is reserved (0 keypoints) and slot ``1`` is person. This helper maps keypoint-bearing categories
+    onto slots with a non-zero keypoint count (``count > 0``), so both layouts keep supervision aligned. For multi-class
+    keypoint training supply e.g. ``[17, 4]`` where each non-zero entry corresponds to a keypoint-bearing category in
+    ascending COCO category ID order.
+    """
+    schema = list(num_keypoints_per_class or [])
+    active_slots = [idx for idx, count in enumerate(schema) if count > 0]
+    if not active_slots:
+        raise ValueError(
+            "Keypoint COCO dataset requested, but num_keypoints_per_class has no active keypoint slots. "
+            "Provide a schema such as [17] for the keypoint preview model."
+        )
+
+    keypoint_cat_ids = _category_ids_with_keypoints(coco)
+    if not keypoint_cat_ids:
+        raise ValueError(
+            "Keypoint COCO dataset has no keypoint category metadata and no keypoint annotations. "
+            "Expected COCO categories with a 'keypoints' field or annotations with 'keypoints'/'num_keypoints'."
+        )
+    if len(keypoint_cat_ids) > len(active_slots):
+        raise ValueError(
+            "Keypoint COCO dataset has more keypoint-bearing categories "
+            f"({len(keypoint_cat_ids)}) than active schema slots ({len(active_slots)}). "
+            "Multi-class keypoint training needs an explicit num_keypoints_per_class schema."
+        )
+
+    sorted_cat_ids = sorted(int(cat_id) for cat_id in coco.cats.keys())
+    required_slots = max(len(sorted_cat_ids), max(active_slots) + 1)
+    assigned_slots: set[int] = set()
+    cat2label: dict[int, int] = {}
+
+    for cat_id, slot in zip(keypoint_cat_ids, active_slots):
+        if slot >= required_slots:
+            raise ValueError(
+                f"Keypoint schema slot {slot} for category_id {cat_id} exceeds the detected class count "
+                f"({len(sorted_cat_ids)}). Pass num_classes large enough to include this keypoint label slot."
+            )
+        cat2label[cat_id] = slot
+        assigned_slots.add(slot)
+
+    free_slots = [slot for slot in range(required_slots) if slot not in assigned_slots]
+    for cat_id in sorted_cat_ids:
+        if cat_id in cat2label:
+            continue
+        if not free_slots:
+            raise ValueError(f"No free model label slots remain for non-keypoint category_id {cat_id}.")
+        cat2label[cat_id] = free_slots.pop(0)
+
+    return cat2label
+
+
 def compute_multi_scale_scales(
     resolution: int,
     expanded_scales: bool = False,
     patch_size: int = 16,
     num_windows: int = 4,
-) -> List[int]:
+) -> list[int]:
     # round to the nearest multiple of 4*patch_size to enable both patching and windowing
     base_num_patches_per_window = resolution // (patch_size * num_windows)
     offsets = [-3, -2, -1, 0, 1, 2, 3, 4] if not expanded_scales else [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]
@@ -70,7 +143,7 @@ def _is_rle(segmentation: Any) -> bool:
     return isinstance(segmentation, dict) and "counts" in segmentation and "size" in segmentation
 
 
-def convert_coco_poly_to_mask(segmentations: List[Any], height: int, width: int) -> torch.Tensor:
+def convert_coco_poly_to_mask(segmentations: list[Any], height: int, width: int) -> Tensor:
     """Convert COCO segmentation annotations to a binary mask tensor of shape ``[N, H, W]``.
 
     Supports both polygon and RLE (Run-Length Encoding) annotation formats. Polygon annotations (lists of coordinate
@@ -153,6 +226,10 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             annotation conversion.  ``None`` means no additional transforms.
         include_masks: If ``True``, decode polygon segmentation masks into binary
             tensors and include them in the target dict under the ``"masks"`` key.
+        include_keypoints: If ``True``, parse COCO keypoints and include them in
+            the target dict under the ``"keypoints"`` key.
+        num_keypoints_per_class: Optional keypoint schema describing the number of
+            keypoints per class. When provided, keypoints are padded/truncated to ``max(num_keypoints_per_class)``.
         remap_category_ids: If ``True``, build a ``cat2label`` mapping from the
             annotation file that remaps sparse category IDs to contiguous 0-based label indices.  The reverse mapping is
             stored as ``label2cat`` on both this object and the underlying COCO API object.  Defaults to ``False``.
@@ -160,18 +237,24 @@ class CocoDetection(torchvision.datasets.CocoDetection):
 
     def __init__(
         self,
-        img_folder: Union[str, Path],
-        ann_file: Union[str, Path],
-        transforms: Optional[Any],
+        img_folder: str | Path,
+        ann_file: str | Path,
+        transforms: Any | None,
         include_masks: bool = False,
+        include_keypoints: bool = False,
+        num_keypoints_per_class: list[int] | None = None,
         remap_category_ids: bool = False,
     ) -> None:
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.include_masks = include_masks
+        self.include_keypoints = include_keypoints
         if remap_category_ids:
             # Mapping from original COCO category_id to contiguous label indices
-            self.cat2label = {cat_id: i for i, cat_id in enumerate(sorted(self.coco.cats.keys()))}
+            if include_keypoints:
+                self.cat2label = _build_keypoint_cat2label(self.coco, num_keypoints_per_class)
+            else:
+                self.cat2label = {cat_id: i for i, cat_id in enumerate(sorted(self.coco.cats.keys()))}
             # Reverse mapping from contiguous label indices back to COCO category_id
             self.label2cat = {label: cat_id for cat_id, label in self.cat2label.items()}
             # Expose label-to-category mapping on the underlying COCO API object for evaluators
@@ -179,9 +262,14 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         else:
             self.cat2label = None
             self.label2cat = None
-        self.prepare = ConvertCoco(include_masks=include_masks, cat2label=self.cat2label)
+        self.prepare = ConvertCoco(
+            include_masks=include_masks,
+            include_keypoints=include_keypoints,
+            cat2label=self.cat2label,
+            num_keypoints_per_class=num_keypoints_per_class,
+        )
 
-    def __getitem__(self, idx: int) -> Tuple[Any, Any]:
+    def __getitem__(self, idx: int) -> tuple[Any, Any]:
         img, target = super(CocoDetection, self).__getitem__(idx)
         image_id = self.ids[idx]
         target = {"image_id": image_id, "annotations": target}
@@ -206,6 +294,8 @@ class ConvertCoco(object):
     - ``"iscrowd"`` – ``(N,)`` int64 tensor (0 = instance, 1 = crowd).
     - ``"masks"`` – ``(N, H, W)`` bool tensor of binary segmentation masks, only
       present when ``include_masks=True``.
+    - ``"keypoints"`` – ``(N, K, 3)`` float32 tensor in COCO keypoint format,
+      only present when ``include_keypoints=True``.
 
     Crowd annotations (``iscrowd=1``) and degenerate boxes (zero width or height after clamping to image boundaries) are
     filtered out.
@@ -217,17 +307,27 @@ class ConvertCoco(object):
             0-based label indices.  When ``None`` (default) the raw ``category_id`` values are used as labels directly,
             which is correct for datasets whose IDs are already 0-indexed.  Pass a non-``None`` mapping for sparse
             COCO-style datasets (e.g. IDs 1–90 with gaps) so that labels stay within the model's output range.
+        num_keypoints_per_class: Optional keypoint schema. When provided, keypoints
+            are padded/truncated to ``max(num_keypoints_per_class)`` in each annotation.
     """
 
-    def __init__(self, include_masks: bool = False, cat2label: Optional[Dict[int, int]] = None) -> None:
+    def __init__(
+        self,
+        include_masks: bool = False,
+        include_keypoints: bool = False,
+        cat2label: dict[int, int] | None = None,
+        num_keypoints_per_class: list[int] | None = None,
+    ) -> None:
         self.include_masks = include_masks
+        self.include_keypoints = include_keypoints
         self.cat2label = cat2label
+        self.num_keypoints = max(num_keypoints_per_class, default=0) if num_keypoints_per_class is not None else 0
 
-    def __call__(self, image: Image.Image, target: Dict[str, Any]) -> Tuple[Image.Image, Dict[str, Any]]:
+    def __call__(self, image: Image.Image, target: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]]:
         w, h = image.size
 
         image_id = target["image_id"]
-        image_id = torch.tensor([image_id])
+        image_id = torch.as_tensor([image_id])
 
         anno = target["annotations"]
 
@@ -240,7 +340,7 @@ class ConvertCoco(object):
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
 
-        classes: List[int] = []
+        classes: list[int] = []
         for obj in anno:
             category_id = obj["category_id"]
             if getattr(self, "cat2label", None) is not None:
@@ -252,7 +352,7 @@ class ConvertCoco(object):
                 classes.append(self.cat2label[category_id])
             else:
                 classes.append(category_id)
-        classes = torch.tensor(classes, dtype=torch.int64)
+        classes = torch.as_tensor(classes, dtype=torch.int64)
 
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
@@ -264,10 +364,45 @@ class ConvertCoco(object):
         target["image_id"] = image_id
 
         # for conversion to coco api
-        area = torch.tensor([obj["area"] for obj in anno])
-        iscrowd = torch.tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
+        area = torch.as_tensor([obj["area"] for obj in anno])
+        iscrowd = torch.as_tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
         target["area"] = area[keep]
         target["iscrowd"] = iscrowd[keep]
+
+        keypoint_keep: Tensor | None = None
+        if self.include_keypoints:
+            num_keypoints = self.num_keypoints
+            if num_keypoints == 0:
+                for obj in anno:
+                    keypoints = obj.get("keypoints")
+                    if keypoints is not None:
+                        num_keypoints = len(keypoints) // 3
+                        break
+
+            keypoint_tensors: list[Tensor] = []
+            for obj in anno:
+                raw_keypoints = obj.get("keypoints")
+                if raw_keypoints is None:
+                    keypoint_tensors.append(torch.zeros((num_keypoints, 3), dtype=torch.float32))
+                    continue
+
+                keypoint_tensor = torch.as_tensor(raw_keypoints, dtype=torch.float32).reshape(-1, 3)
+                if keypoint_tensor.shape[0] < num_keypoints:
+                    padded = torch.zeros((num_keypoints, 3), dtype=torch.float32)
+                    padded[: keypoint_tensor.shape[0]] = keypoint_tensor
+                    keypoint_tensors.append(padded)
+                    continue
+                keypoint_tensors.append(keypoint_tensor[:num_keypoints])
+
+            if len(keypoint_tensors) > 0:
+                keypoints_out = torch.stack(keypoint_tensors, dim=0)
+            else:
+                keypoints_out = torch.zeros((0, num_keypoints, 3), dtype=torch.float32)
+            target["keypoints"] = keypoints_out[keep]
+            # Do NOT filter instances with all-invisible keypoints (v=0).
+            # The keypoint loss already handles zero-visibility via valid_visibility
+            # masking; filtering here silently removes box/class supervision for
+            # occluded subjects and prevents training on valid person detections.
 
         # add segmentation masks if requested, otherwise ensure consistent key when include_masks=True
         if self.include_masks:
@@ -282,6 +417,8 @@ class ConvertCoco(object):
                 target["masks"] = torch.zeros((0, h, w), dtype=torch.uint8)
 
             target["masks"] = target["masks"].bool()
+            if keypoint_keep is not None:
+                target["masks"] = target["masks"][keypoint_keep]
 
         target["orig_size"] = torch.as_tensor([int(h), int(w)])
         target["size"] = torch.as_tensor([int(h), int(w)])
@@ -290,11 +427,11 @@ class ConvertCoco(object):
 
 
 def _build_train_resize_config(
-    scales: List[int],
+    scales: list[int],
     *,
     square: bool,
-    max_size: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+    max_size: int | None = None,
+) -> list[dict[str, Any]]:
     """Build the training resize pipeline as an Albumentations config list.
 
     Expresses the ``RandomSelect(resize_a, Compose([resize_b1, crop, resize_b2]))`` pattern as a config-driven
@@ -321,12 +458,12 @@ def _build_train_resize_config(
         A single-element list containing a ``OneOf`` config entry.
     """
     if square:
-        option_a: Dict[str, Any] = {
+        option_a: dict[str, Any] = {
             "OneOf": {
                 "transforms": [{"Resize": {"height": s, "width": s}} for s in scales],
             }
         }
-        option_b: Dict[str, Any] = {
+        option_b: dict[str, Any] = {
             "Sequential": {
                 "transforms": [
                     {"SmallestMaxSize": {"max_size": [400, 500, 600]}},
@@ -375,8 +512,9 @@ def make_coco_transforms(
     skip_random_resize: bool = False,
     patch_size: int = 16,
     num_windows: int = 4,
-    aug_config: Optional[Dict[str, Dict[str, Any]]] = None,
+    aug_config: dict[str, dict[str, Any]] | None = None,
     gpu_postprocess: bool = False,
+    keypoint_flip_pairs: list[int] | None = None,
 ) -> Compose:
     """Build the standard COCO transform pipeline for a given dataset split.
 
@@ -409,7 +547,7 @@ def make_coco_transforms(
             :func:`compute_multi_scale_scales` to derive candidate resolutions.
         aug_config: Albumentations augmentation config dict passed to
             :class:`~rfdetr.datasets.transforms.AlbumentationsWrapper`.  Falls back to the default
-            :data:`~rfdetr.datasets.aug_config.AUG_CONFIG` when ``None``.
+            :data:`~rfdetr.datasets.aug_configs.AUG_CONFIG` when ``None``.
         gpu_postprocess: When ``True``, skip Albumentations augmentation wrappers and
             ``Normalize`` from the CPU pipeline.  The ``RFDETRDataModule`` then applies both augmentation and
             normalization on the GPU in ``on_after_batch_transfer``.  Has no effect on val/test splits.
@@ -446,7 +584,9 @@ def make_coco_transforms(
         )
         pipeline = [*resize_wrappers]
         if not gpu_postprocess:
-            aug_wrappers = AlbumentationsWrapper.from_config(resolved_aug_config)
+            aug_wrappers = AlbumentationsWrapper.from_config(
+                resolved_aug_config, keypoint_flip_pairs=keypoint_flip_pairs
+            )
             pipeline += [*aug_wrappers]
         pipeline += [to_image, to_float]
         if not gpu_postprocess:
@@ -476,8 +616,9 @@ def make_coco_transforms_square_div_64(
     skip_random_resize: bool = False,
     patch_size: int = 16,
     num_windows: int = 4,
-    aug_config: Optional[Dict[str, Dict[str, Any]]] = None,
+    aug_config: dict[str, dict[str, Any]] | None = None,
     gpu_postprocess: bool = False,
+    keypoint_flip_pairs: list[int] | None = None,
 ) -> Compose:
     """Create COCO transforms with square resizing where the output size is divisible by 64.
 
@@ -506,7 +647,7 @@ def make_coco_transforms_square_div_64(
             derive the list of candidate square resolutions.
         aug_config: Augmentation configuration dictionary compatible with
             :class:`~rfdetr.datasets.transforms.AlbumentationsWrapper`. If ``None``, the default
-            :data:`~rfdetr.datasets.aug_config.AUG_CONFIG` is used.
+            :data:`~rfdetr.datasets.aug_configs.AUG_CONFIG` is used.
         gpu_postprocess: When ``True``, skip Albumentations augmentation wrappers and
             ``Normalize`` from the CPU pipeline.  The ``RFDETRDataModule`` then applies both augmentation and
             normalization on the GPU in ``on_after_batch_transfer``.  Has no effect on val/test splits.
@@ -531,7 +672,9 @@ def make_coco_transforms_square_div_64(
         resize_wrappers = AlbumentationsWrapper.from_config(_build_train_resize_config(scales, square=True))
         pipeline = [*resize_wrappers]
         if not gpu_postprocess:
-            aug_wrappers = AlbumentationsWrapper.from_config(resolved_aug_config)
+            aug_wrappers = AlbumentationsWrapper.from_config(
+                resolved_aug_config, keypoint_flip_pairs=keypoint_flip_pairs
+            )
             pipeline += [*aug_wrappers]
         pipeline += [to_image, to_float]
         if not gpu_postprocess:
@@ -551,7 +694,9 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
         logger.error(f"COCO path {root} does not exist")
         raise FileNotFoundError(f"COCO path {root} does not exist")
 
-    mode = "instances"
+    # Detection dataset args may omit keypoint fields; default to the detection annotation path.
+    has_keypoints = getattr(args, "use_grouppose_keypoints", False)
+    mode = "person_keypoints" if has_keypoints else "instances"
     PATHS = {  # noqa: N806
         "train": (root / "train2017", root / "annotations" / f"{mode}_train2017.json"),
         "val": (root / "val2017", root / "annotations" / f"{mode}_val2017.json"),
@@ -562,7 +707,10 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
 
     square_resize_div_64 = getattr(args, "square_resize_div_64", False)
     include_masks = getattr(args, "segmentation_head", False)
+    include_keypoints = has_keypoints
+    num_keypoints_per_class = getattr(args, "num_keypoints_per_class", [])
     aug_config = getattr(args, "aug_config", None)
+    keypoint_flip_pairs: list[int] = getattr(args, "keypoint_flip_pairs", []) or []
     augmentation_backend = getattr(args, "augmentation_backend", "cpu")
     resolved_augmentation_backend = _resolve_runtime_augmentation_backend(augmentation_backend)
     if resolved_augmentation_backend != augmentation_backend and resolved_augmentation_backend == "cpu":
@@ -587,8 +735,15 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
                 num_windows=args.num_windows,
                 aug_config=aug_config,
                 gpu_postprocess=gpu_postprocess,
+                keypoint_flip_pairs=keypoint_flip_pairs,
             ),
             include_masks=include_masks,
+            include_keypoints=include_keypoints,
+            num_keypoints_per_class=num_keypoints_per_class,
+            # NOTE: remap_category_ids and num_keypoints_per_class schema are coupled.
+            # Active-first [17] maps keypoint categories to slot 0; changing either without
+            # the other silently misaligns training supervision.
+            remap_category_ids=include_keypoints,
         )
     else:
         logger.info(f"Building COCO {image_set} dataset at resolution {resolution}")
@@ -605,8 +760,15 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
                 num_windows=args.num_windows,
                 aug_config=aug_config,
                 gpu_postprocess=gpu_postprocess,
+                keypoint_flip_pairs=keypoint_flip_pairs,
             ),
             include_masks=include_masks,
+            include_keypoints=include_keypoints,
+            num_keypoints_per_class=num_keypoints_per_class,
+            # NOTE: remap_category_ids and num_keypoints_per_class schema are coupled.
+            # Active-first [17] maps keypoint categories to slot 0; changing either without
+            # the other silently misaligns training supervision.
+            remap_category_ids=include_keypoints,
         )
     return dataset
 
@@ -649,6 +811,10 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
     do_random_resize_via_padding = getattr(args, "do_random_resize_via_padding", False)
     patch_size = getattr(args, "patch_size", 16)
     num_windows = getattr(args, "num_windows", 4)
+    # Roboflow detection exports omit keypoint schema/flip-pair fields; missing values mean detection-only.
+    include_keypoints = getattr(args, "use_grouppose_keypoints", False)
+    num_keypoints_per_class = getattr(args, "num_keypoints_per_class", [])
+    keypoint_flip_pairs: list[int] = getattr(args, "keypoint_flip_pairs", []) or []
     aug_config = getattr(args, "aug_config", None)
     resolved_augmentation_backend = _resolve_runtime_augmentation_backend(getattr(args, "augmentation_backend", "cpu"))
     gpu_postprocess = resolved_augmentation_backend != "cpu"
@@ -668,8 +834,11 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
                 num_windows=num_windows,
                 aug_config=aug_config,
                 gpu_postprocess=gpu_postprocess,
+                keypoint_flip_pairs=keypoint_flip_pairs,
             ),
             include_masks=include_masks,
+            include_keypoints=include_keypoints,
+            num_keypoints_per_class=num_keypoints_per_class,
             remap_category_ids=True,
         )
     else:
@@ -687,8 +856,11 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
                 num_windows=num_windows,
                 aug_config=aug_config,
                 gpu_postprocess=gpu_postprocess,
+                keypoint_flip_pairs=keypoint_flip_pairs,
             ),
             include_masks=include_masks,
+            include_keypoints=include_keypoints,
+            num_keypoints_per_class=num_keypoints_per_class,
             remap_category_ids=True,
         )
     return dataset
